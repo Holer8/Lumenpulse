@@ -21,6 +21,67 @@
 
 ## 1. Overview
 
+## CORS and Security Headers
+
+This section records the CORS policy and the security headers served by the
+backend API, and the tests that verify them.
+
+### CORS policy
+
+- The allowlist is defined by the `CORS_ORIGIN` environment variable. When set
+  to a single origin it is used verbatim; when set to a comma-separated list it
+  becomes an explicit allowlist. There is no wildcard `*` origin.
+- In production the backend refuses to start unless `CORS_ORIGIN` is set
+  (`apps/backend/src/lib/config.ts`).
+- The global CORS policy does **not** permit credentialed requests
+  (`credentials: false`). Endpoint-specific gateways that genuinely need
+  credentialed cross-origin requests must opt in explicitly (see
+  `PriceGateway` below).
+- Preflight responses (`OPTIONS`) carry the allowlist origin, allowed methods,
+  allowed headers and a 24-hour `max-age` (`86400`).
+- Rate-limit response headers are exposed to browser callers via
+  `Access-Control-Expose-Headers` so that authenticated web clients can read
+  `Retry-After`, `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset`.
+
+### Security headers
+
+Every response is decorated by `helmet` with the following headers:
+
+| Header | Value / intent |
+|---|---|
+| Content-Security-Policy | Defaults: `default-src 'self'`; `frame-ancestors 'none'`; `form-action 'self'`; `base-uri 'self'`. `crossOriginEmbedderPolicy: false` is set to keep WebSockets working. |
+| X-Content-Type-Options | `nosniff` |
+| X-Frame-Options | Set by helmet (value depends on CSP config) |
+| Strict-Transport-Security | Set by helmet when the response is served over HTTPS |
+| Referrer-Policy | Set by helmet |
+
+### WebSocket gateway CORS
+
+`PriceGateway` (`apps/backend/src/price/price.gateway.ts`) reads
+`CORS_ORIGIN` at gateway configuration time and splits it into an allowlist.
+The previous `origin: '*'` has been replaced with the explicit allowlist so the
+WebSocket channel is subject to the same origin restrictions as the HTTP API.
+
+### Tests
+
+`apps/backend/test/cors-and-security-headers.e2e-spec.ts` covers:
+
+- Rejections of origins not in the allowlist
+- Acceptance of the configured origin
+- Absence of `Access-Control-Allow-Credentials: true`
+- Preflight (`OPTIONS`) behaviour and header contents
+- Security header presence (CSP, X-Content-Type-Options, X-Frame-Options,
+  Strict-Transport-Security when present)
+- CORS exposure of rate-limit headers
+
+### Accepted deviations
+
+- The health smoke endpoint `/health` is not throttled, so rate-limit headers
+  are not asserted on that path in this suite. The throttled-path behaviour is
+  covered by `rate-limit-validation.e2e-spec.ts`.
+- The `Server` header is not stripped; a follow-up can remove it once a custom
+  value is acceptable for this service.
+
 LumenPulse is a decentralised crypto news aggregator and portfolio management platform built on the Stellar/Soroban blockchain. The system spans five layers:
 
 - **Webapp** (Next.js) — browser-based UI
@@ -47,7 +108,7 @@ This document records what the system is defending against, where the trust boun
 | `JWT_SECRET` | Critical | Signs all access and refresh tokens |
 | `SOROBAN_INGEST_SECRET` | High | HMAC secret for Soroban event webhook ingestion |
 | `WEBHOOK_SECRET` / `WEBHOOK_PROVIDERS` | High | HMAC/RSA/Ed25519 secrets for internal service webhooks |
-| `PYTHON_API_KEY` | Medium | Shared secret between backend and data-processing service |
+| Managed service API keys | Medium | Per-consumer secrets; only SHA-256 verifiers are stored in PostgreSQL |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | High | S3 asset upload credentials |
 | `TELEGRAM_BOT_TOKEN` | Medium | Alerting bot token |
 | User wallet public keys | Low | Non-secret; cached in mobile SecureStore and DB |
@@ -67,8 +128,8 @@ This document records what the system is defending against, where the trust boun
 |---|---|
 | Authenticated user | Human who has completed email+password (+ optional 2FA) login and holds a valid JWT |
 | Contract admin | Holder of the admin keypair registered in a Soroban contract |
-| Backend service | The NestJS process; communicates with data-processing over an internal network using `PYTHON_API_KEY` |
-| Data-processing service | The FastAPI process; authenticates inbound requests with `X-API-Key` |
+| Backend service | The NestJS process; communicates with data-processing over an internal network using a scoped service API key |
+| Data-processing service | The FastAPI process; authenticates inbound requests with `X-API-Key` against managed verifiers or temporary legacy env keys |
 | Soroban RPC relay | Trusted Stellar network endpoint |
 
 ### Partially Trusted
@@ -146,7 +207,8 @@ All authenticated API calls cross this boundary.
 | Session revocation | `GET /auth/sessions`, `POST /auth/sessions/:id/revoke` — queries `refresh_tokens` table; sets `revokedAt`; only owner can revoke |
 | 2FA (optional) | `apps/backend/src/auth/auth.service.ts` — speakeasy TOTP; QR code provisioning |
 | Stellar wallet challenge | `auth.service.ts` — SEP-10-style nonce challenge signed by the client wallet; server keypair `STELLAR_SERVER_SECRET` |
-| CORS | Configured in `CORS_ORIGIN`; enforced by NestJS CORS middleware |
+| CORS | Explicit per-origin allowlist via `CORS_ORIGIN`; single string resolves to that origin; multiple origins resolve to an allowlist. No wildcard origins; no credentialed cross-origin requests in the global policy. See [CORS and Security Headers](#cors-and-security-headers) for the full policy and test coverage. |
+| Security headers | `helmet` middleware on every response with a tightened Content-Security-Policy (defaultSrc/frameAncestors/formAction/baseUri: 'self'/'none'), plus X-Content-Type-Options, X-Frame-Options, Strict-Transport-Security (on HTTPS), and Referrer-Policy. See [CORS and Security Headers](#cors-and-security-headers) for the full header inventory and test coverage. |
 | Refresh token rotation | 30-day TTL; stored hashed in `refresh_tokens` table; invalidated on logout or revocation |
 | Password hashing | bcrypt, 10 rounds (`AuthService.BCRYPT_SALT_ROUNDS`) |
 | Password reset | 32-byte random token, 1-hour TTL (`apps/backend/src/auth/entities/password-reset-token.entity.ts`) |
@@ -159,7 +221,9 @@ The NestJS backend calls the Python FastAPI service for sentiment analysis and M
 
 | Control | Implementation |
 |---|---|
-| API key header auth | `apps/data-processing/src/security.py` — `SecurityConfig.validate_api_key()`; checks `X-API-Key` header against `API_KEY` env var; returns 401 if missing, 403 if wrong |
+| API key header auth | `apps/data-processing/src/security.py` — `SecurityConfig.validate_api_key()`; checks `X-API-Key` against active SHA-256 verifiers in `service_api_keys`, enforces scopes, and temporarily accepts `API_KEY`/`API_KEYS` environment credentials during migration |
+| Key management | Admin-only `service-consumers/:consumerId/api-keys` endpoints issue, list, rotate, and revoke keys; raw secrets are returned once and never stored or logged |
+| Consumer attribution | Python logs and `service_api_key_requests_total` metric use consumer ID, method, and required scope, never key values |
 | Rate limiting (inbound) | `security.py` — slowapi `Limiter`; default 100 req/min, strict 10 req/min; **currently uses in-memory storage — must be Redis in production** (see [Accepted Risks](#7-accepted-risks)) |
 | Path exclusions | Health (`/health`), metrics (`/metrics`), docs (`/docs`, `/redoc`, `/openapi.json`), and `/sentiment/legend` skip API key check |
 
@@ -251,7 +315,7 @@ News APIs and social platforms push untrusted free text (articles, posts, predic
 | Threat | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | Unauthenticated access to ML/analytics endpoints | Low | Medium | `X-API-Key` middleware in `security.py`; 401/403 on missing/invalid key |
-| Key leakage via environment | Low | Medium | `PYTHON_API_KEY` injected via platform secrets; not committed to repo |
+| Key leakage via environment | Low | Medium | Managed key values are injected via platform secrets; only verifiers are stored; legacy shared environment keys remain a temporary migration fallback |
 | Rate-limit saturation (in-memory) | Medium | Medium | **Accepted risk** — see Section 7; in-memory limiter resets on process restart |
 | Sensitive data exfiltration via exposed docs | Low | Low | `/docs`, `/redoc`, `/openapi.json` excluded from API key requirement — these pages describe the API but contain no user data |
 
@@ -314,7 +378,7 @@ News APIs and social platforms push untrusted free text (articles, posts, predic
 |---|---|---|---|
 | `JWT_SECRET` | Signs all JWT tokens | Platform secret manager / env injection | Rotate in env; existing tokens become invalid immediately; users re-login |
 | `STELLAR_SERVER_SECRET` | SEP-10-style wallet challenge signing | Platform secret manager / env injection | Rotate in env; outstanding challenges (5-minute TTL) expire naturally |
-| `PYTHON_API_KEY` | Backend → data-processing auth | Both services' env; never in source code | Rotate simultaneously in both services; brief downtime if not done atomically |
+| Managed service API keys | Service-consumer authentication | SHA-256 verifier in PostgreSQL; raw secret in consumer secret manager | Issue a replacement key, deploy it, then revoke the old key; overlap is supported |
 | `SOROBAN_INGEST_SECRET` | Webhook HMAC for Soroban event ingestion | Backend env | Rotate via runtime provider API or env restart |
 | `WEBHOOK_SECRET` / `WEBHOOK_PROVIDERS` secrets | Service-to-service webhook auth | Backend env | Rotate via `PUT /webhooks/admin/providers/:name` without restart |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | S3 asset uploads | Backend env | Rotate in AWS IAM; update env |

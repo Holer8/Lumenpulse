@@ -48,8 +48,10 @@ export type DeepLinkRouteKey =
   | 'receipt'
   | 'discover'
   | 'notifications'
+  | 'vestingClaim'
   | 'grants'
-  | 'projects';
+  | 'projects'
+  | 'priceAlerts';
 
 /**
  * The deep link route table. Every notification-tappable screen must be
@@ -67,8 +69,15 @@ export const DEEP_LINK_ROUTES: Record<DeepLinkRouteKey, RouteConfig> = {
   discover: { path: '/discover', authRequired: false },
   /** In-app notification inbox — wrapped in ProtectedRoute. */
   notifications: { path: '/notifications', authRequired: true },
+  /**
+   * Vesting / treasury claim — wrapped in ProtectedRoute. Opened from the
+   * portfolio tab and from "your vesting is claimable" notifications.
+   */
+  vestingClaim: { path: '/vesting-claim', authRequired: true },
   /** Grant round detail — wrapped in ProtectedRoute. */
   grants: { path: '/grants/:id', authRequired: true },
+  /** Price alert management — wrapped in ProtectedRoute. */
+  priceAlerts: { path: '/settings/price-alerts', authRequired: true },
   /** Crowdfund project detail — public. */
   projects: { path: '/projects/:id', authRequired: false },
 };

@@ -44,6 +44,7 @@ import {
 import { TestController } from './test/test.controller';
 import { UploadModule } from './upload/upload.module';
 import { AuthModule } from './auth/auth.module';
+import { SupportModeModule } from './support-mode/support-mode.module';
 import { UsersModule } from './users/users.module';
 import { GrantsModule } from './grants/grants.module';
 import { HealthModule } from './health/health.module';
@@ -64,6 +65,7 @@ import { CrowdfundSyncModule } from './crowdfund-sync/crowdfund-sync.module';
 import { ContributorRegistryModule } from './contributor-registry/contributor-registry.module';
 import { AuditModule } from './audit/audit.module';
 import { AuditLogInterceptor } from './audit/interceptors/audit-log.interceptor';
+import { DataRetentionModule } from './data-retention/data-retention.module';
 import { SorobanEventsModule } from './soroban-events/soroban-events.module';
 import { TreasuryModule } from './treasury/treasury.module';
 import { VestingWalletModule } from './vesting-wallet/vesting-wallet.module';
@@ -84,6 +86,7 @@ import { ProfilingModule } from './common/profiling/profiling.module';
 import { QueryCountMiddleware } from './common/profiling/query-count.middleware';
 import { DashboardModule } from './dashboard/dashboard.module';
 import { SavedSearchesModule } from './saved-searches/saved-searches.module';
+import { ServiceApiKeysModule } from './service-api-keys/service-api-keys.module';
 
 @Module({
   imports: [
@@ -145,6 +148,7 @@ import { SavedSearchesModule } from './saved-searches/saved-searches.module';
     WebhookModule,
     UploadModule,
     AuthModule,
+    SupportModeModule,
     UsersModule,
     HealthModule,
     SchedulerModule,
@@ -177,6 +181,9 @@ import { SavedSearchesModule } from './saved-searches/saved-searches.module';
 
     // Audit
     AuditModule,
+
+    // Data retention and user erasure
+    DataRetentionModule,
 
     // Soroban event processing
     SorobanEventsModule,
@@ -230,6 +237,7 @@ import { SavedSearchesModule } from './saved-searches/saved-searches.module';
 
     // Saved searches & subscriptions
     SavedSearchesModule,
+    ServiceApiKeysModule,
   ],
   controllers: [AppController, TestController, TestExceptionController],
   providers: [

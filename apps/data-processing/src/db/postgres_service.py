@@ -48,6 +48,7 @@ from .models import (
     PredictionLog,
     SentimentLabel,
     AnalyticsJob,
+    FeatureDriftRetrainingCooldown,
 )
 from .cohort_models import (
     GrantRound,
@@ -3300,25 +3301,46 @@ class PostgresService:
         end_date: Optional[str] = None,
         period: str = "daily",
         limit: int = 100,
-    ) -> List[DailyOnchainKPISnapshot]:
+        offset: int = 0,
+    ) -> Tuple[List[DailyOnchainKPISnapshot], int]:
         """
-        Retrieve historical daily on-chain KPI snapshots.
+        Retrieve historical daily on-chain KPI snapshots with stable ordering
+        and pagination (#1458).
+
+        Ordering is ``snapshot_date DESC, id DESC`` so pages remain stable as
+        history accumulates. Returns ``(page_items, total_matching)``.
         """
+        from src.utils.pagination import clamp_limit, clamp_offset
+
+        limit = clamp_limit(limit)
+        offset = clamp_offset(offset)
         try:
             with self.get_session() as session:
-                stmt = select(DailyOnchainKPISnapshot).where(
-                    DailyOnchainKPISnapshot.period == period
-                )
+                filters = [DailyOnchainKPISnapshot.period == period]
                 if start_date:
-                    stmt = stmt.where(DailyOnchainKPISnapshot.snapshot_date >= start_date)
+                    filters.append(DailyOnchainKPISnapshot.snapshot_date >= start_date)
                 if end_date:
-                    stmt = stmt.where(DailyOnchainKPISnapshot.snapshot_date <= end_date)
+                    filters.append(DailyOnchainKPISnapshot.snapshot_date <= end_date)
 
-                stmt = stmt.order_by(desc(DailyOnchainKPISnapshot.snapshot_date)).limit(limit)
-                return session.execute(stmt).scalars().all()
+                total = session.execute(
+                    select(func.count()).select_from(DailyOnchainKPISnapshot).where(and_(*filters))
+                ).scalar_one()
+
+                stmt = (
+                    select(DailyOnchainKPISnapshot)
+                    .where(and_(*filters))
+                    .order_by(
+                        desc(DailyOnchainKPISnapshot.snapshot_date),
+                        desc(DailyOnchainKPISnapshot.id),
+                    )
+                    .limit(limit)
+                    .offset(offset)
+                )
+                items = list(session.execute(stmt).scalars().all())
+                return items, int(total or 0)
         except SQLAlchemyError as e:
             logger.error(f"Failed to retrieve daily on-chain KPI snapshots: {e}")
-            return []
+            return [], 0
 
     def get_latest_daily_onchain_kpi_snapshot(
         self,
@@ -3454,6 +3476,69 @@ class PostgresService:
         except SQLAlchemyError as e:
             logger.error(f"Failed to look up active analytics job: {e}")
             return None
+
+    def claim_feature_drift_retraining_cooldown(
+        self,
+        drift_signature: str,
+        drift_event_id: str,
+        cooldown_seconds: float,
+    ) -> bool:
+        """Atomically claim a drift signature until its cooldown expires."""
+        try:
+            FeatureDriftRetrainingCooldown.__table__.create(
+                bind=self.engine, checkfirst=True
+            )
+            now = datetime.utcnow()
+            expires_before = now - timedelta(seconds=cooldown_seconds)
+            values = {
+                "drift_signature": drift_signature,
+                "drift_event_id": drift_event_id,
+                "triggered_at": now,
+            }
+            if self.engine.dialect.name == "postgresql":
+                from sqlalchemy.dialects.postgresql import insert
+            elif self.engine.dialect.name == "sqlite":
+                from sqlalchemy.dialects.sqlite import insert
+            else:
+                raise RuntimeError(
+                    "Drift retraining cooldown requires PostgreSQL or SQLite"
+                )
+
+            statement = insert(FeatureDriftRetrainingCooldown).values(**values)
+            statement = statement.on_conflict_do_update(
+                index_elements=["drift_signature"],
+                set_={
+                    "drift_event_id": drift_event_id,
+                    "triggered_at": now,
+                },
+                where=FeatureDriftRetrainingCooldown.triggered_at <= expires_before,
+            )
+            with self.get_session() as session:
+                result = session.execute(statement)
+                return result.rowcount == 1
+        except SQLAlchemyError as e:
+            logger.error("Failed to claim feature drift retraining cooldown: %s", e)
+            raise
+
+    def release_feature_drift_retraining_cooldown(
+        self, drift_signature: str, drift_event_id: str
+    ) -> None:
+        """Release a claim when retraining could not be submitted."""
+        try:
+            with self.get_session() as session:
+                session.execute(
+                    delete(FeatureDriftRetrainingCooldown).where(
+                        and_(
+                            FeatureDriftRetrainingCooldown.drift_signature
+                            == drift_signature,
+                            FeatureDriftRetrainingCooldown.drift_event_id
+                            == drift_event_id,
+                        )
+                    )
+                )
+        except SQLAlchemyError as e:
+            logger.error("Failed to release feature drift cooldown claim: %s", e)
+            raise
 
     def create_analytics_job(
         self,
